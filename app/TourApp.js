@@ -42,11 +42,17 @@ function loadHomes() {
   try {
     const raw = localStorage.getItem('haveniq_homes')
     if (!raw) return []
-    // Normalise older records that predate dateSeen / hidden fields
     return JSON.parse(raw).map(h => ({
       ...h,
       dateSeen: h.dateSeen || tsToDateStr(h.createdAt),
       hidden:   h.hidden   ?? false,
+      // Migrate old single-photo field to photos array
+      rooms: Object.fromEntries(
+        Object.entries(h.rooms || {}).map(([name, r]) => {
+          const { photo, ...rest } = r
+          return [name, { ...rest, photos: r.photos ?? (photo ? [photo] : []) }]
+        })
+      ),
     }))
   } catch {
     return []
@@ -60,7 +66,7 @@ function persist(homes) {
 function makeHome({ address, price, beds, baths, sqft, listingUrl }) {
   const rooms = {}
   STANDARD_ROOMS.forEach(name => {
-    rooms[name] = { reaction: null, photo: null, voiceNote: '', textNote: '' }
+    rooms[name] = { reaction: null, photos: [], voiceNote: '', textNote: '' }
   })
   const now = Date.now()
   return {
@@ -85,7 +91,7 @@ function homeStats(home) {
   const loved  = entries.filter(([, r]) => r.reaction === 'love').length
   const okay   = entries.filter(([, r]) => r.reaction === 'okay').length
   const no     = entries.filter(([, r]) => r.reaction === 'no'  ).length
-  const photos = entries.filter(([, r]) => r.photo              ).length
+  const photos = entries.filter(([, r]) => r.photos?.length > 0  ).length
   return { loved, okay, no, photos, total: entries.length, rated: loved + okay + no }
 }
 
@@ -108,21 +114,27 @@ function resizeImage(dataUrl, maxW = 1200, maxH = 900) {
 // ── Main component ─────────────────────────────────────────────────────────────
 
 export default function TourApp() {
-  const [homes,        setHomes       ] = useState([])
-  const [view,         setView        ] = useState('list')
-  const [homeId,       setHomeId      ] = useState(null)
-  const [roomName,     setRoomName    ] = useState(null)
-  const [form,         setForm        ] = useState({ address: '', price: '', beds: '', baths: '', sqft: '', listingUrl: '' })
-  const [newRoomName,  setNewRoomName ] = useState('')
-  const [recording,    setRecording   ] = useState(false)
-  const [lightbox,     setLightbox    ] = useState(null)
-  const [compareIds,   setCompareIds  ] = useState([])   // IDs selected for compare
-  const [editingDate,  setEditingDate ] = useState(false) // inline date editor in grid header
-  const [reviewOrigin, setReviewOrigin] = useState('grid') // 'grid' | 'hub'
-  const [roomOrigin,   setRoomOrigin  ] = useState('grid') // 'grid' | 'review' — where to return after room detail
+  const [homes,          setHomes         ] = useState([])
+  const [view,           setView          ] = useState('list')
+  const [homeId,         setHomeId        ] = useState(null)
+  const [roomName,       setRoomName      ] = useState(null)
+  const [form,           setForm          ] = useState({ address: '', price: '', beds: '', baths: '', sqft: '', listingUrl: '' })
+  const [newRoomName,    setNewRoomName   ] = useState('')
+  const [recording,      setRecording     ] = useState(false)
+  const [lightbox,       setLightbox      ] = useState(null)
+  const [compareIds,     setCompareIds    ] = useState([])
+  const [editingDate,    setEditingDate   ] = useState(false)
+  const [reviewOrigin,   setReviewOrigin  ] = useState('grid')
+  const [roomOrigin,     setRoomOrigin    ] = useState('grid')
+  const [speechSupported, setSpeechSupported] = useState(false)
   const recRef = useRef(null)
 
   useEffect(() => { setHomes(loadHomes()) }, [])
+
+  // Detect SpeechRecognition once on mount — Safari/iPhone doesn't support it
+  useEffect(() => {
+    setSpeechSupported(!!(window.SpeechRecognition || window.webkitSpeechRecognition))
+  }, [])
 
   function setAndSave(updater) {
     setHomes(prev => {
@@ -138,8 +150,6 @@ export default function TourApp() {
   function goGrid() { setEditingDate(false); setView('grid') }
   function goHub()  { setView('review-hub') }
 
-  // Guard: if a view requires a selected home but none is loaded, redirect cleanly.
-  // homes.length > 0 check prevents firing before the initial localStorage load.
   const VIEW_NEEDS_HOME = ['grid', 'add-room', 'room', 'overall', 'review']
   if (VIEW_NEEDS_HOME.includes(view) && !home && homes.length > 0) {
     return (
@@ -184,13 +194,13 @@ export default function TourApp() {
     if (!name.trim()) return
     setAndSave(prev => prev.map(h => {
       if (h.id !== hid || h.rooms[name]) return h
-      return { ...h, rooms: { ...h.rooms, [name]: { reaction: null, photo: null, voiceNote: '', textNote: '' } } }
+      return { ...h, rooms: { ...h.rooms, [name]: { reaction: null, photos: [], voiceNote: '', textNote: '' } } }
     }))
   }
 
   function toggleHidden(hid) {
     setAndSave(prev => prev.map(h => h.id !== hid ? h : { ...h, hidden: !h.hidden }))
-    setCompareIds(prev => prev.filter(id => id !== hid)) // remove from compare if hiding
+    setCompareIds(prev => prev.filter(id => id !== hid))
   }
 
   function updateDateSeen(hid, dateStr) {
@@ -202,24 +212,49 @@ export default function TourApp() {
     setCompareIds(prev => prev.includes(id) ? prev.filter(x => x !== id) : [...prev, id])
   }
 
-  // ── Photo ──────────────────────────────────────────────────────────────────
+  // ── Photos ─────────────────────────────────────────────────────────────────
 
+  // Handles one or more files; appends each resized photo to the room's photos array
   function handlePhoto(e, hid, rname) {
-    const file = e.target.files?.[0]
-    if (!file) return
-    const reader = new FileReader()
-    reader.onload = async ev => {
-      const resized = await resizeImage(ev.target.result)
-      patchRoom(hid, rname, { photo: resized })
-    }
-    reader.readAsDataURL(file)
+    const files = Array.from(e.target.files || [])
+    if (!files.length) return
+    files.forEach(file => {
+      const reader = new FileReader()
+      reader.onload = async ev => {
+        const resized = await resizeImage(ev.target.result)
+        setAndSave(prev => prev.map(h =>
+          h.id !== hid ? h : {
+            ...h,
+            rooms: {
+              ...h.rooms,
+              [rname]: { ...h.rooms[rname], photos: [...(h.rooms[rname].photos || []), resized] },
+            },
+          }
+        ))
+      }
+      reader.readAsDataURL(file)
+    })
+    // Reset input so the same file can be re-added if needed
+    e.target.value = ''
+  }
+
+  function removePhoto(hid, rname, idx) {
+    setAndSave(prev => prev.map(h =>
+      h.id !== hid ? h : {
+        ...h,
+        rooms: {
+          ...h.rooms,
+          [rname]: { ...h.rooms[rname], photos: h.rooms[rname].photos.filter((_, i) => i !== idx) },
+        },
+      }
+    ))
   }
 
   // ── Voice note ─────────────────────────────────────────────────────────────
 
   function startRecording(hid, rname) {
     const SR = window.SpeechRecognition || window.webkitSpeechRecognition
-    if (!SR) { alert('Voice recognition not supported. Try Chrome on Android.'); return }
+    if (!SR) return
     const sr = new SR()
     sr.continuous = false
     sr.interimResults = false
@@ -303,7 +338,6 @@ export default function TourApp() {
               <p className="text-white font-semibold text-sm truncate">{home.address}</p>
               <div className="flex items-center gap-2 flex-wrap mt-0.5">
                 <span className="text-teal-300 text-xs">{rated}/{entries.length} rooms</span>
-                {/* Date seen — always visible, tap to edit */}
                 {editingDate ? (
                   <input
                     type="date"
@@ -350,9 +384,9 @@ export default function TourApp() {
                 {rx
                   ? <span className={`text-xs mt-0.5 font-medium ${rx.text}`}>{rx.label}</span>
                   : <span className="text-xs mt-0.5 text-slate-400">Tap to rate</span>}
-                {(rdata.photo || rdata.voiceNote || rdata.textNote) && (
+                {(rdata.photos?.length > 0 || rdata.voiceNote || rdata.textNote) && (
                   <div className="flex gap-1 mt-1">
-                    {rdata.photo && <span className="text-xs">📷</span>}
+                    {rdata.photos?.length > 0 && <span className="text-xs">📷</span>}
                     {(rdata.voiceNote || rdata.textNote) && <span className="text-xs">📝</span>}
                   </div>
                 )}
@@ -404,6 +438,7 @@ export default function TourApp() {
   // ── Room detail ────────────────────────────────────────────────────────────
   if (view === 'room' && home && roomName) {
     const rdata = home.rooms[roomName]
+    const photos = rdata.photos || []
     return (
       <Screen>
         {lightbox && (
@@ -422,6 +457,7 @@ export default function TourApp() {
         <Header back={roomOrigin === 'review' ? () => setView('review') : goGrid} title={roomName} />
         <div className="p-4 flex flex-col gap-6 pb-6">
 
+          {/* Reaction */}
           <div>
             <SectionLabel>How do you feel about this room?</SectionLabel>
             <div className="flex flex-col gap-3 mt-2">
@@ -447,52 +483,71 @@ export default function TourApp() {
             </div>
           </div>
 
+          {/* Photos — multiple, library or camera, thumbnail grid */}
           <div>
-            <SectionLabel>Photo</SectionLabel>
-            {rdata.photo ? (
-              <div className="mt-2 relative">
-                <button onClick={() => setLightbox(rdata.photo)}
-                  className="w-full rounded-xl overflow-hidden block" title="Tap to enlarge">
-                  <img src={rdata.photo} alt="Room" className="w-full rounded-xl"
-                    style={{ maxHeight: '200px', objectFit: 'contain', background: '#f1f5f9', display: 'block' }} />
-                  <div className="absolute inset-0 flex items-end justify-end p-2 pointer-events-none">
-                    <span className="bg-black/50 text-white text-xs px-2 py-0.5 rounded-full">tap to enlarge</span>
+            <SectionLabel>Photos</SectionLabel>
+            {photos.length > 0 && (
+              <div className="mt-2 grid grid-cols-3 gap-2">
+                {photos.map((photo, idx) => (
+                  <div key={idx} className="relative">
+                    <button onClick={() => setLightbox(photo)}
+                      className="block w-full rounded-xl overflow-hidden">
+                      <img src={photo} alt={`Room photo ${idx + 1}`}
+                        className="w-full rounded-xl"
+                        style={{ height: '90px', objectFit: 'cover', display: 'block' }} />
+                    </button>
+                    <button onClick={() => removePhoto(home.id, roomName, idx)}
+                      className="absolute top-1 left-1 bg-black/60 text-white rounded-full w-6 h-6 flex items-center justify-center text-xs font-bold leading-none">
+                      ✕
+                    </button>
                   </div>
-                </button>
-                <button onClick={() => patchRoom(home.id, roomName, { photo: null })}
-                  className="absolute top-2 left-2 bg-black/60 text-white rounded-full w-7 h-7 flex items-center justify-center text-sm font-bold">
-                  ✕
-                </button>
+                ))}
               </div>
-            ) : (
-              <label className="mt-2 flex items-center gap-3 bg-white border-2 border-dashed border-slate-300 rounded-xl p-4 cursor-pointer active:bg-slate-50">
-                <span className="text-2xl">📷</span>
-                <span className="text-slate-600 font-medium">Take or choose a photo</span>
-                <input type="file" accept="image/*" capture="environment" className="sr-only"
-                  onChange={e => handlePhoto(e, home.id, roomName)} />
-              </label>
             )}
+            {/* No capture attribute → lets user choose camera or photo library */}
+            <label className="mt-2 flex items-center gap-3 bg-white border-2 border-dashed border-slate-300 rounded-xl p-4 cursor-pointer active:bg-slate-50">
+              <span className="text-2xl">📷</span>
+              <span className="text-slate-600 font-medium">
+                {photos.length > 0 ? 'Add another photo' : 'Take or add a photo'}
+              </span>
+              <input type="file" accept="image/*" multiple className="sr-only"
+                onChange={e => handlePhoto(e, home.id, roomName)} />
+            </label>
           </div>
 
+          {/* Voice note — shown only if browser supports SpeechRecognition */}
           <div>
             <SectionLabel>Voice note</SectionLabel>
-            <button onClick={recording ? stopRecording : () => startRecording(home.id, roomName)}
-              className={`mt-2 flex items-center gap-3 w-full p-4 rounded-xl border-2 transition-all
-                ${recording ? 'bg-red-50 border-red-400' : 'bg-white border-slate-300'}`}>
-              <span className="text-2xl">{recording ? '⏹' : '🎤'}</span>
-              <span className={`font-medium ${recording ? 'text-red-600 animate-pulse' : 'text-slate-600'}`}>
-                {recording ? 'Recording… tap to stop' : 'Tap to record'}
-              </span>
-            </button>
-            {rdata.voiceNote && (
-              <div className="mt-2 bg-slate-100 rounded-xl p-3 text-sm text-slate-700 relative pr-12">
-                <p>{rdata.voiceNote}</p>
-                <button onClick={() => patchRoom(home.id, roomName, { voiceNote: '' })}
-                  className="absolute top-2 right-3 text-slate-400 text-xs">Clear</button>
+            {speechSupported ? (
+              <>
+                <button onClick={recording ? stopRecording : () => startRecording(home.id, roomName)}
+                  className={`mt-2 flex items-center gap-3 w-full p-4 rounded-xl border-2 transition-all
+                    ${recording ? 'bg-red-50 border-red-400' : 'bg-white border-slate-300'}`}>
+                  <span className="text-2xl">{recording ? '⏹' : '🎤'}</span>
+                  <span className={`font-medium ${recording ? 'text-red-600 animate-pulse' : 'text-slate-600'}`}>
+                    {recording ? 'Recording… tap to stop' : 'Tap to record'}
+                  </span>
+                </button>
+                {rdata.voiceNote && (
+                  <div className="mt-2 bg-slate-100 rounded-xl p-3 text-sm text-slate-700 relative pr-12">
+                    <p>{rdata.voiceNote}</p>
+                    <button onClick={() => patchRoom(home.id, roomName, { voiceNote: '' })}
+                      className="absolute top-2 right-3 text-slate-400 text-xs">Clear</button>
+                  </div>
+                )}
+              </>
+            ) : (
+              <div className="mt-2 bg-slate-50 border border-slate-200 rounded-xl p-4 flex items-start gap-3">
+                <span className="text-xl shrink-0">⌨️</span>
+                <p className="text-sm text-slate-600 leading-relaxed">
+                  Tap the <strong>Notes</strong> field below, then tap the{' '}
+                  <strong>microphone on your keyboard</strong> to dictate. Your words will save automatically.
+                </p>
               </div>
             )}
           </div>
 
+          {/* Notes — standard textarea; iPhone keyboard dictation works naturally here */}
           <div>
             <SectionLabel>Notes</SectionLabel>
             <textarea rows={3} placeholder="Anything else about this room…"
@@ -538,7 +593,7 @@ export default function TourApp() {
     )
   }
 
-  // ── Per-home review (richer) ───────────────────────────────────────────────
+  // ── Per-home review ────────────────────────────────────────────────────────
   if (view === 'review' && home) {
     const entries = Object.entries(home.rooms)
     const { loved, okay, no, photos, total, rated: ratedCount } = homeStats(home)
@@ -613,7 +668,7 @@ export default function TourApp() {
             </span>
             {photos > 0 && (
               <span className="bg-slate-100 text-slate-600 text-xs px-3 py-1 rounded-full">
-                📷 {photos} photo{photos !== 1 ? 's' : ''}
+                📷 {photos} room{photos !== 1 ? 's' : ''} with photos
               </span>
             )}
           </div>
@@ -640,8 +695,8 @@ export default function TourApp() {
                         )}
                       </div>
                       <div className="flex gap-1 shrink-0 mt-0.5">
-                        {rdata.photo    && <span className="text-xs">📷</span>}
-                        {rdata.voiceNote && <span className="text-xs">🎤</span>}
+                        {rdata.photos?.length > 0 && <span className="text-xs">📷</span>}
+                        {rdata.voiceNote         && <span className="text-xs">🎤</span>}
                       </div>
                     </button>
                   )
@@ -650,7 +705,7 @@ export default function TourApp() {
             </div>
           )}
 
-          {/* Unrated rooms — shown as small chips */}
+          {/* Unrated rooms */}
           {unratedRooms.length > 0 && (
             <div>
               <p className="text-xs font-semibold text-slate-400 uppercase tracking-wide mb-2">Not yet rated</p>
@@ -709,7 +764,6 @@ export default function TourApp() {
             </div>
           )}
 
-          {/* Active home cards */}
           {active.map(h => {
             const { loved, okay, no, photos } = homeStats(h)
             const selected = compareIds.includes(h.id)
@@ -718,7 +772,6 @@ export default function TourApp() {
                 className={`bg-white rounded-2xl border-2 overflow-hidden transition-all
                   ${selected ? 'border-teal-500 shadow-md' : 'border-slate-200'}`}>
 
-                {/* Top bar: compare toggle + full-review link */}
                 <div className="px-4 pt-3 flex items-center justify-between gap-2">
                   <button onClick={() => toggleCompare(h.id)}
                     className="flex items-center gap-2">
@@ -741,7 +794,6 @@ export default function TourApp() {
                   </button>
                 </div>
 
-                {/* Tappable body → goes to room grid */}
                 <button onClick={() => { setHomeId(h.id); setView('grid') }}
                   className="w-full text-left px-4 py-3">
                   <p className="font-semibold text-slate-800 text-sm leading-snug">{h.address}</p>
@@ -768,7 +820,6 @@ export default function TourApp() {
                   )}
                 </button>
 
-                {/* Out of running action */}
                 <div className="px-4 pb-3 border-t border-slate-100 pt-2">
                   <button onClick={() => toggleHidden(h.id)}
                     className="text-xs text-slate-400 underline underline-offset-2">
@@ -779,7 +830,6 @@ export default function TourApp() {
             )
           })}
 
-          {/* Out of the running section */}
           {hidden.length > 0 && (
             <div className="mt-2">
               <p className="text-xs font-semibold text-slate-400 uppercase tracking-wide mb-3">
@@ -814,7 +864,6 @@ export default function TourApp() {
           )}
         </div>
 
-        {/* Sticky compare CTA — visible when 2+ homes are selected */}
         {canCompare && (
           <div className="fixed bottom-0 left-0 right-0 flex justify-center pointer-events-none" style={{ zIndex: 40 }}>
             <div className="w-full max-w-[480px] pointer-events-auto bg-white border-t border-slate-200 px-4 py-3">
@@ -893,10 +942,8 @@ export default function TourApp() {
             </div>
           )}
 
-          {/* Active homes */}
           {activeHomes.map(h => <HomeCard key={h.id} h={h} />)}
 
-          {/* Out of the running — dimmed, with Restore button */}
           {hiddenHomes.length > 0 && (
             <div className="mt-2">
               <p className="text-xs font-semibold text-slate-400 uppercase tracking-wide mb-3">
@@ -989,7 +1036,6 @@ function Field({ label, children }) {
 
 // ── Compare view ───────────────────────────────────────────────────────────────
 
-// Four visually distinct colors, one per compared home
 const COMPARE_PALETTE = [
   { bg: 'bg-teal-500',   border: 'border-teal-300',   light: 'bg-teal-50',   text: 'text-teal-700',   chip: 'bg-teal-500'   },
   { bg: 'bg-violet-500', border: 'border-violet-300', light: 'bg-violet-50', text: 'text-violet-700', chip: 'bg-violet-500' },
@@ -997,7 +1043,6 @@ const COMPARE_PALETTE = [
   { bg: 'bg-rose-500',   border: 'border-rose-300',   light: 'bg-rose-50',   text: 'text-rose-700',   chip: 'bg-rose-500'   },
 ]
 
-// "123 Maple Street, Austin TX" → "123 Maple"
 function shortLabel(address) {
   const street = address.split(',')[0].trim()
   const words  = street.split(/\s+/)
@@ -1009,14 +1054,12 @@ function CompareView({ compareHomes, onBack }) {
   const [expandedId, setExpandedId] = useState(null)
   const [lightbox,   setLightbox  ] = useState(null)
 
-  // Attach stable color + label by insertion order
   const homes = compareHomes.map((h, i) => ({
     ...h,
     _color: COMPARE_PALETTE[i % COMPARE_PALETTE.length],
     _label: shortLabel(h.address),
   }))
 
-  // Union of all room names across compared homes, preserving standard order first
   const allRoomNames = [
     ...new Set([
       ...STANDARD_ROOMS.filter(r => compareHomes.some(h => h.rooms[r])),
@@ -1034,12 +1077,10 @@ function CompareView({ compareHomes, onBack }) {
   ]
 
   return (
-    // Custom centering shell (no Screen component) so we can have a sticky top band
     <div className="min-h-screen bg-slate-200">
       <div className="mx-auto w-full bg-slate-50 flex flex-col min-h-screen"
         style={{ maxWidth: '480px' }}>
 
-        {/* Lightbox */}
         {lightbox && (
           <div className="fixed inset-0 z-50 bg-black/92 flex items-center justify-center p-4"
             onClick={() => setLightbox(null)}>
@@ -1053,10 +1094,7 @@ function CompareView({ compareHomes, onBack }) {
           </div>
         )}
 
-        {/* ── Sticky top band ── */}
         <div className="sticky top-0 z-10">
-
-          {/* Header */}
           <header className="bg-navy px-4 py-4 flex items-center gap-3">
             <BackBtn onClick={onBack} />
             <h1 className="text-white font-semibold text-lg">
@@ -1064,7 +1102,6 @@ function CompareView({ compareHomes, onBack }) {
             </h1>
           </header>
 
-          {/* At-a-glance summary — one compact row per home */}
           <div className="bg-white border-b border-slate-200 px-4 py-2.5 flex flex-col gap-1.5">
             {homes.map(h => {
               const { loved, okay, no } = homeStats(h)
@@ -1084,7 +1121,6 @@ function CompareView({ compareHomes, onBack }) {
             })}
           </div>
 
-          {/* Attribute chip selector */}
           <div className="bg-white border-b border-slate-200 py-2.5">
             <div className="overflow-x-auto px-4">
               <div className="flex gap-1.5 w-max">
@@ -1101,10 +1137,7 @@ function CompareView({ compareHomes, onBack }) {
           </div>
         </div>
 
-        {/* ── Scrollable attribute content ── */}
         <div className="flex-1 p-4 flex flex-col gap-3 pb-8">
-
-          {/* Section label for current attribute */}
           <p className="text-xs font-semibold text-slate-400 uppercase tracking-wide">
             {ATTRS.find(a => a.id === attr)?.label ?? attr}
           </p>
@@ -1114,8 +1147,6 @@ function CompareView({ compareHomes, onBack }) {
             return (
               <div key={h.id}
                 className={`rounded-2xl border-2 overflow-hidden bg-white ${h._color.border}`}>
-
-                {/* Color-labeled home strip */}
                 <div className={`px-4 py-2 flex items-center justify-between ${h._color.light}`}>
                   <div className="flex items-center gap-2">
                     <span className={`w-2.5 h-2.5 rounded-full ${h._color.bg}`} />
@@ -1129,12 +1160,10 @@ function CompareView({ compareHomes, onBack }) {
                   </button>
                 </div>
 
-                {/* Focused attribute content */}
                 <div className="px-4 py-3">
                   <CompareAttrContent home={h} attr={attr} onLightbox={setLightbox} />
                 </div>
 
-                {/* Expanded full-detail section */}
                 {isExpanded && (
                   <div className="border-t border-slate-100 px-4 py-3 flex flex-col gap-3 bg-slate-50/50">
                     <CompareExpandedDetail home={h} />
@@ -1145,7 +1174,6 @@ function CompareView({ compareHomes, onBack }) {
           })}
         </div>
 
-        {/* Back button */}
         <div className="p-4 border-t border-slate-200 bg-slate-50">
           <button onClick={onBack} className="btn-secondary">← Back to review hub</button>
         </div>
@@ -1154,7 +1182,6 @@ function CompareView({ compareHomes, onBack }) {
   )
 }
 
-// Renders the selected attribute's content for one home
 function CompareAttrContent({ home, attr, onLightbox }) {
 
   if (attr === 'overview') {
@@ -1203,14 +1230,14 @@ function CompareAttrContent({ home, attr, onLightbox }) {
     return <p className="text-sm font-medium text-slate-700">📅 {formatDate(home.dateSeen)}</p>
   }
 
-  // Room attribute
   const room = home.rooms[attr]
   if (!room) {
     return <p className="text-xs text-slate-400 italic">Room not tracked for this home</p>
   }
 
   const rx = REACTIONS.find(r => r.id === room.reaction)
-  const hasContent = rx || room.textNote || room.voiceNote || room.photo
+  const roomPhotos = room.photos || []
+  const hasContent = rx || room.textNote || room.voiceNote || roomPhotos.length > 0
 
   return (
     <div className="flex flex-col gap-2.5">
@@ -1229,14 +1256,16 @@ function CompareAttrContent({ home, attr, onLightbox }) {
         </p>
       )}
 
-      {room.photo && (
-        <button onClick={() => onLightbox(room.photo)} className="relative block w-full">
-          <img src={room.photo} alt={attr} className="w-full rounded-xl"
-            style={{ maxHeight: '160px', objectFit: 'contain', background: '#f1f5f9', display: 'block' }} />
-          <div className="absolute inset-0 flex items-end justify-end p-2 pointer-events-none">
-            <span className="bg-black/50 text-white text-xs px-2 py-0.5 rounded-full">tap to enlarge</span>
-          </div>
-        </button>
+      {roomPhotos.length > 0 && (
+        <div className="flex flex-wrap gap-2">
+          {roomPhotos.map((photo, idx) => (
+            <button key={idx} onClick={() => onLightbox(photo)} className="relative block">
+              <img src={photo} alt={`${attr} photo ${idx + 1}`}
+                className="rounded-xl"
+                style={{ width: '72px', height: '72px', objectFit: 'cover', display: 'block' }} />
+            </button>
+          ))}
+        </div>
       )}
 
       {!hasContent && (
@@ -1246,7 +1275,6 @@ function CompareAttrContent({ home, attr, onLightbox }) {
   )
 }
 
-// Full detail shown when a home card is expanded
 function CompareExpandedDetail({ home }) {
   const entries    = Object.entries(home.rooms)
   const ratedRooms = entries.filter(([, r]) => r.reaction)
@@ -1254,7 +1282,6 @@ function CompareExpandedDetail({ home }) {
 
   return (
     <>
-      {/* All rated rooms at a glance */}
       {ratedRooms.length > 0 && (
         <div>
           <p className="text-xs font-semibold text-slate-400 uppercase tracking-wide mb-2">All rooms</p>
@@ -1273,8 +1300,8 @@ function CompareExpandedDetail({ home }) {
                     )}
                   </div>
                   <div className="flex gap-1 shrink-0">
-                    {rdata.photo    && <span className="text-xs">📷</span>}
-                    {rdata.voiceNote && <span className="text-xs">🎤</span>}
+                    {rdata.photos?.length > 0 && <span className="text-xs">📷</span>}
+                    {rdata.voiceNote          && <span className="text-xs">🎤</span>}
                   </div>
                 </div>
               )
@@ -1283,7 +1310,6 @@ function CompareExpandedDetail({ home }) {
         </div>
       )}
 
-      {/* Overall notes */}
       {hasOverall && (
         <div className="bg-white rounded-xl p-3 border border-slate-100 flex flex-col gap-2">
           {[
@@ -1300,7 +1326,6 @@ function CompareExpandedDetail({ home }) {
         </div>
       )}
 
-      {/* Listing link */}
       {home.listingUrl && (
         <a href={home.listingUrl} target="_blank" rel="noopener noreferrer"
           className="text-xs text-teal-600 font-semibold underline underline-offset-2 self-start">
