@@ -10,9 +10,9 @@ const STANDARD_ROOMS = [
 ]
 
 const REACTIONS = [
-  { id: 'love', label: 'Love it',      emoji: '❤️', dot: 'bg-emerald-500', tile: 'bg-emerald-50 border-emerald-300', text: 'text-emerald-600' },
-  { id: 'okay', label: "It's okay",    emoji: '👍', dot: 'bg-amber-400',   tile: 'bg-amber-50 border-amber-300',   text: 'text-amber-600'  },
-  { id: 'no',   label: 'Not for me',   emoji: '👎', dot: 'bg-red-500',     tile: 'bg-red-50 border-red-300',       text: 'text-red-600'    },
+  { id: 'love', label: 'Love it',    emoji: '❤️', dot: 'bg-emerald-500', tile: 'bg-emerald-50 border-emerald-300', text: 'text-emerald-600' },
+  { id: 'okay', label: "It's okay",  emoji: '👍', dot: 'bg-amber-400',   tile: 'bg-amber-50 border-amber-300',   text: 'text-amber-600'  },
+  { id: 'no',   label: 'Not for me', emoji: '👎', dot: 'bg-red-500',     tile: 'bg-red-50 border-red-300',       text: 'text-red-600'    },
 ]
 
 // ── Date helpers ───────────────────────────────────────────────────────────────
@@ -44,9 +44,9 @@ function loadHomes() {
     if (!raw) return []
     return JSON.parse(raw).map(h => ({
       ...h,
+      nickname: h.nickname || '',
       dateSeen: h.dateSeen || tsToDateStr(h.createdAt),
       hidden:   h.hidden   ?? false,
-      // Migrate old single-photo field to photos array
       rooms: Object.fromEntries(
         Object.entries(h.rooms || {}).map(([name, r]) => {
           const { photo, ...rest } = r
@@ -71,6 +71,7 @@ function makeHome({ address, price, beds, baths, sqft, listingUrl }) {
   const now = Date.now()
   return {
     id: uid(),
+    nickname:   '',
     address,
     price:      price      || '',
     beds:       beds       || '',
@@ -85,7 +86,19 @@ function makeHome({ address, price, beds, baths, sqft, listingUrl }) {
   }
 }
 
-// Quick stats across all rooms for a home
+// Returns nickname if set, else the real address
+function displayName(home) {
+  return home.nickname?.trim() || home.address
+}
+
+// Short label for compare chips — uses nickname if set
+function shortLabel(home) {
+  if (home.nickname?.trim()) return home.nickname.trim().slice(0, 16)
+  const street = home.address.split(',')[0].trim()
+  const words  = street.split(/\s+/)
+  return words.length >= 2 ? `${words[0]} ${words[1]}` : street.slice(0, 16)
+}
+
 function homeStats(home) {
   const entries = Object.entries(home.rooms)
   const loved  = entries.filter(([, r]) => r.reaction === 'love').length
@@ -95,7 +108,6 @@ function homeStats(home) {
   return { loved, okay, no, photos, total: entries.length, rated: loved + okay + no }
 }
 
-// Resize via canvas before storing — keeps localStorage light
 function resizeImage(dataUrl, maxW = 1200, maxH = 900) {
   return new Promise(resolve => {
     const img = new Image()
@@ -114,26 +126,31 @@ function resizeImage(dataUrl, maxW = 1200, maxH = 900) {
 // ── Main component ─────────────────────────────────────────────────────────────
 
 export default function TourApp() {
-  const [homes,          setHomes         ] = useState([])
-  const [view,           setView          ] = useState('list')
-  const [homeId,         setHomeId        ] = useState(null)
-  const [roomName,       setRoomName      ] = useState(null)
-  const [form,           setForm          ] = useState({ address: '', price: '', beds: '', baths: '', sqft: '', listingUrl: '' })
-  const [newRoomName,    setNewRoomName   ] = useState('')
-  const [recording,      setRecording     ] = useState(false)
-  const [lightbox,       setLightbox      ] = useState(null)
-  const [compareIds,     setCompareIds    ] = useState([])
-  const [editingDate,    setEditingDate   ] = useState(false)
-  const [reviewOrigin,   setReviewOrigin  ] = useState('grid')
-  const [roomOrigin,     setRoomOrigin    ] = useState('grid')
+  const [homes,           setHomes          ] = useState([])
+  const [view,            setView           ] = useState('list')
+  const [homeId,          setHomeId         ] = useState(null)
+  const [roomName,        setRoomName       ] = useState(null)
+  const [form,            setForm           ] = useState({ address: '', price: '', beds: '', baths: '', sqft: '', listingUrl: '' })
+  const [editForm,        setEditForm       ] = useState({ nickname: '', address: '', price: '', beds: '', baths: '', sqft: '', listingUrl: '' })
+  const [newRoomName,     setNewRoomName    ] = useState('')
+  const [recording,       setRecording      ] = useState(false)
+  const [lightbox,        setLightbox       ] = useState(null)
+  const [compareIds,      setCompareIds     ] = useState([])
+  const [editingDate,     setEditingDate    ] = useState(false)
+  const [reviewOrigin,    setReviewOrigin   ] = useState('grid')
+  const [roomOrigin,      setRoomOrigin     ] = useState('grid')
   const [speechSupported, setSpeechSupported] = useState(false)
   const recRef = useRef(null)
 
   useEffect(() => { setHomes(loadHomes()) }, [])
 
-  // Detect SpeechRecognition once on mount — Safari/iPhone doesn't support it
+  // Detect SpeechRecognition. iOS Safari declares webkitSpeechRecognition in
+  // some versions but it silently fails at runtime — exclude iOS entirely.
   useEffect(() => {
-    setSpeechSupported(!!(window.SpeechRecognition || window.webkitSpeechRecognition))
+    const isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent) ||
+      (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1)
+    const hasSR = !!(window.SpeechRecognition || window.webkitSpeechRecognition)
+    setSpeechSupported(hasSR && !isIOS)
   }, [])
 
   function setAndSave(updater) {
@@ -146,11 +163,24 @@ export default function TourApp() {
 
   const home = homes.find(h => h.id === homeId)
 
-  function goHome() { setView('list') }
-  function goGrid() { setEditingDate(false); setView('grid') }
-  function goHub()  { setView('review-hub') }
+  function goHome()  { setView('list') }
+  function goGrid()  { setEditingDate(false); setView('grid') }
+  function goHub()   { setView('review-hub') }
+  function goEditHome() {
+    if (!home) return
+    setEditForm({
+      nickname:   home.nickname   || '',
+      address:    home.address    || '',
+      price:      home.price      || '',
+      beds:       home.beds       || '',
+      baths:      home.baths      || '',
+      sqft:       home.sqft       || '',
+      listingUrl: home.listingUrl || '',
+    })
+    setView('edit-home')
+  }
 
-  const VIEW_NEEDS_HOME = ['grid', 'add-room', 'room', 'overall', 'review']
+  const VIEW_NEEDS_HOME = ['grid', 'add-room', 'room', 'overall', 'review', 'edit-home']
   if (VIEW_NEEDS_HOME.includes(view) && !home && homes.length > 0) {
     return (
       <Screen>
@@ -176,6 +206,25 @@ export default function TourApp() {
     setForm({ address: '', price: '', beds: '', baths: '', sqft: '', listingUrl: '' })
     setHomeId(h.id)
     setView('grid')
+  }
+
+  function submitEditHome(e) {
+    e.preventDefault()
+    if (!editForm.address.trim()) return
+    patchHome(home.id, {
+      nickname:   editForm.nickname.trim(),
+      address:    editForm.address.trim(),
+      price:      editForm.price,
+      beds:       editForm.beds,
+      baths:      editForm.baths,
+      sqft:       editForm.sqft,
+      listingUrl: editForm.listingUrl,
+    })
+    goGrid()
+  }
+
+  function patchHome(hid, patch) {
+    setAndSave(prev => prev.map(h => h.id !== hid ? h : { ...h, ...patch }))
   }
 
   function patchRoom(hid, rname, patch) {
@@ -214,7 +263,6 @@ export default function TourApp() {
 
   // ── Photos ─────────────────────────────────────────────────────────────────
 
-  // Handles one or more files; appends each resized photo to the room's photos array
   function handlePhoto(e, hid, rname) {
     const files = Array.from(e.target.files || [])
     if (!files.length) return
@@ -234,7 +282,6 @@ export default function TourApp() {
       }
       reader.readAsDataURL(file)
     })
-    // Reset input so the same file can be re-added if needed
     e.target.value = ''
   }
 
@@ -310,15 +357,60 @@ export default function TourApp() {
                 onChange={e => setForm(p => ({ ...p, sqft: e.target.value }))} className="input" />
             </Field>
             <Field label="Beds">
-              <input type="number" placeholder="3" value={form.beds}
-                onChange={e => setForm(p => ({ ...p, beds: e.target.value }))} className="input" />
+              <NumberStepper value={form.beds} onChange={v => setForm(p => ({ ...p, beds: v }))} />
             </Field>
             <Field label="Baths">
-              <input type="number" placeholder="2" value={form.baths}
-                onChange={e => setForm(p => ({ ...p, baths: e.target.value }))} className="input" />
+              <NumberStepper value={form.baths} onChange={v => setForm(p => ({ ...p, baths: v }))} />
             </Field>
           </div>
           <button type="submit" className="btn-primary mt-auto">Start Tour →</button>
+        </form>
+      </Screen>
+    )
+  }
+
+  // ── Edit home ──────────────────────────────────────────────────────────────
+  if (view === 'edit-home' && home) {
+    return (
+      <Screen>
+        <Header back={goGrid} title="Edit home" />
+        <form onSubmit={submitEditHome} className="flex flex-col gap-4 p-4 flex-1">
+          <Field label="Nickname (optional)">
+            <input placeholder="e.g. The blue one, Maple St dream…"
+              value={editForm.nickname}
+              onChange={e => setEditForm(p => ({ ...p, nickname: e.target.value }))}
+              className="input" />
+            <p className="text-xs text-slate-400 mt-1">Shown as the home's display name if set.</p>
+          </Field>
+          <Field label="Address *">
+            <input required placeholder="123 Maple St, Austin TX"
+              value={editForm.address}
+              onChange={e => setEditForm(p => ({ ...p, address: e.target.value }))}
+              className="input" />
+          </Field>
+          <Field label="Listing URL">
+            <input type="url" placeholder="https://zillow.com/homedetails/…"
+              value={editForm.listingUrl}
+              onChange={e => setEditForm(p => ({ ...p, listingUrl: e.target.value }))}
+              className="input" />
+          </Field>
+          <div className="grid grid-cols-2 gap-3">
+            <Field label="Price ($)">
+              <input type="number" placeholder="450000" value={editForm.price}
+                onChange={e => setEditForm(p => ({ ...p, price: e.target.value }))} className="input" />
+            </Field>
+            <Field label="Sq ft">
+              <input type="number" placeholder="1800" value={editForm.sqft}
+                onChange={e => setEditForm(p => ({ ...p, sqft: e.target.value }))} className="input" />
+            </Field>
+            <Field label="Beds">
+              <NumberStepper value={editForm.beds} onChange={v => setEditForm(p => ({ ...p, beds: v }))} />
+            </Field>
+            <Field label="Baths">
+              <NumberStepper value={editForm.baths} onChange={v => setEditForm(p => ({ ...p, baths: v }))} />
+            </Field>
+          </div>
+          <button type="submit" className="btn-primary mt-auto">Save changes</button>
         </form>
       </Screen>
     )
@@ -328,14 +420,28 @@ export default function TourApp() {
   if (view === 'grid' && home) {
     const entries = Object.entries(home.rooms)
     const rated = entries.filter(([, r]) => r.reaction).length
+    const hasNickname = !!home.nickname?.trim()
 
     return (
       <Screen>
         <header className="bg-navy px-4 py-3">
-          <div className="flex items-center gap-2">
+          <div className="flex items-start gap-2">
             <BackBtn onClick={goHome} />
-            <div className="flex-1 min-w-0">
-              <p className="text-white font-semibold text-sm truncate">{home.address}</p>
+            <div className="flex-1 min-w-0 pt-0.5">
+              {/* Display name row with inline edit link */}
+              <div className="flex items-baseline gap-2 min-w-0">
+                <p className="text-white font-semibold text-sm leading-snug truncate">
+                  {displayName(home)}
+                </p>
+                <button onClick={goEditHome}
+                  className="text-teal-300 text-xs underline underline-offset-1 shrink-0 leading-snug">
+                  edit
+                </button>
+              </div>
+              {/* Real address shown below if a nickname is active */}
+              {hasNickname && (
+                <p className="text-teal-200 text-xs truncate leading-snug">{home.address}</p>
+              )}
               <div className="flex items-center gap-2 flex-wrap mt-0.5">
                 <span className="text-teal-300 text-xs">{rated}/{entries.length} rooms</span>
                 {editingDate ? (
@@ -358,14 +464,14 @@ export default function TourApp() {
               </div>
               {home.listingUrl && (
                 <a href={home.listingUrl} target="_blank" rel="noopener noreferrer"
-                  className="text-teal-200 text-xs underline underline-offset-2 mt-0.5 block">
+                  className="text-teal-200 text-xs underline underline-offset-2 mt-0.5 block truncate">
                   View listing ↗
                 </a>
               )}
             </div>
             <button
               onClick={() => { setReviewOrigin('grid'); setView('review') }}
-              className="bg-teal-500 text-white text-sm font-semibold px-3 py-1.5 rounded-lg shrink-0">
+              className="bg-teal-500 text-white text-sm font-semibold px-3 py-1.5 rounded-lg shrink-0 mt-0.5">
               Review
             </button>
           </div>
@@ -483,7 +589,7 @@ export default function TourApp() {
             </div>
           </div>
 
-          {/* Photos — multiple, library or camera, thumbnail grid */}
+          {/* Photos — contain (no crop), multiple, library or camera */}
           <div>
             <SectionLabel>Photos</SectionLabel>
             {photos.length > 0 && (
@@ -491,10 +597,10 @@ export default function TourApp() {
                 {photos.map((photo, idx) => (
                   <div key={idx} className="relative">
                     <button onClick={() => setLightbox(photo)}
-                      className="block w-full rounded-xl overflow-hidden">
+                      className="block w-full rounded-xl overflow-hidden bg-slate-100">
                       <img src={photo} alt={`Room photo ${idx + 1}`}
                         className="w-full rounded-xl"
-                        style={{ height: '90px', objectFit: 'cover', display: 'block' }} />
+                        style={{ height: '90px', objectFit: 'contain', display: 'block', background: '#f1f5f9' }} />
                     </button>
                     <button onClick={() => removePhoto(home.id, roomName, idx)}
                       className="absolute top-1 left-1 bg-black/60 text-white rounded-full w-6 h-6 flex items-center justify-center text-xs font-bold leading-none">
@@ -504,7 +610,6 @@ export default function TourApp() {
                 ))}
               </div>
             )}
-            {/* No capture attribute → lets user choose camera or photo library */}
             <label className="mt-2 flex items-center gap-3 bg-white border-2 border-dashed border-slate-300 rounded-xl p-4 cursor-pointer active:bg-slate-50">
               <span className="text-2xl">📷</span>
               <span className="text-slate-600 font-medium">
@@ -515,7 +620,7 @@ export default function TourApp() {
             </label>
           </div>
 
-          {/* Voice note — shown only if browser supports SpeechRecognition */}
+          {/* Voice note — hidden on iOS Safari, shown on supporting browsers */}
           <div>
             <SectionLabel>Voice note</SectionLabel>
             {speechSupported ? (
@@ -609,7 +714,9 @@ export default function TourApp() {
           <div className="flex items-center gap-3">
             <BackBtn onClick={backFn} />
             <div className="flex-1 min-w-0">
-              <p className="text-white font-semibold text-base">My Review</p>
+              <p className="text-white font-semibold text-base leading-snug truncate">
+                {displayName(home)}
+              </p>
               <p className="text-teal-300 text-xs truncate">{home.address}</p>
             </div>
           </div>
@@ -617,9 +724,11 @@ export default function TourApp() {
 
         <div className="p-4 flex flex-col gap-4 pb-8">
 
-          {/* Home meta card */}
           <div className="bg-white rounded-2xl p-4 border border-slate-100">
-            <p className="font-semibold text-slate-800 text-base leading-snug">{home.address}</p>
+            <p className="font-semibold text-slate-800 text-base leading-snug">{displayName(home)}</p>
+            {home.nickname?.trim() && (
+              <p className="text-xs text-slate-400 mt-0.5">{home.address}</p>
+            )}
             <div className="flex flex-wrap gap-x-3 gap-y-0 mt-1 text-xs text-slate-500">
               {home.price && <span>${Number(home.price).toLocaleString()}</span>}
               {home.beds  && <span>{home.beds} bed</span>}
@@ -637,7 +746,6 @@ export default function TourApp() {
             </div>
           </div>
 
-          {/* Overall feeling callout */}
           {home.overall.feeling && (
             <div className="bg-teal-50 border border-teal-200 rounded-2xl p-4">
               <p className="text-xs font-semibold text-teal-600 uppercase tracking-wide mb-1">Overall feeling</p>
@@ -645,7 +753,6 @@ export default function TourApp() {
             </div>
           )}
 
-          {/* Stat cards */}
           <div className="grid grid-cols-3 gap-2">
             {[
               { label: 'Loved', count: loved, bg: 'bg-emerald-500' },
@@ -661,7 +768,6 @@ export default function TourApp() {
             ))}
           </div>
 
-          {/* Summary pills */}
           <div className="flex gap-2 flex-wrap">
             <span className="bg-slate-100 text-slate-600 text-xs px-3 py-1 rounded-full">
               {ratedCount}/{total} rooms rated
@@ -673,7 +779,6 @@ export default function TourApp() {
             )}
           </div>
 
-          {/* Rated rooms */}
           {ratedRooms.length > 0 && (
             <div>
               <p className="text-xs font-semibold text-slate-400 uppercase tracking-wide mb-2">Rooms</p>
@@ -705,7 +810,6 @@ export default function TourApp() {
             </div>
           )}
 
-          {/* Unrated rooms */}
           {unratedRooms.length > 0 && (
             <div>
               <p className="text-xs font-semibold text-slate-400 uppercase tracking-wide mb-2">Not yet rated</p>
@@ -721,15 +825,14 @@ export default function TourApp() {
             </div>
           )}
 
-          {/* Overall notes */}
           {hasOverall && (
             <div className="bg-navy rounded-2xl p-4">
               <p className="text-teal-300 font-semibold text-sm mb-3">Overall notes</p>
               {[
-                { key: 'likes',    label: '❤️ Loved'      },
-                { key: 'dislikes', label: '✕ Didn\'t work' },
-                { key: 'feeling',  label: '💭 Feeling'     },
-                { key: 'closing',  label: '📌 Closing'     },
+                { key: 'likes',    label: '❤️ Loved'       },
+                { key: 'dislikes', label: "✕ Didn't work"  },
+                { key: 'feeling',  label: '💭 Feeling'      },
+                { key: 'closing',  label: '📌 Closing'      },
               ].filter(f => home.overall[f.key]).map(f => (
                 <div key={f.key} className="mb-3 last:mb-0">
                   <p className="text-xs text-slate-400">{f.label}</p>
@@ -772,31 +875,40 @@ export default function TourApp() {
                 className={`bg-white rounded-2xl border-2 overflow-hidden transition-all
                   ${selected ? 'border-teal-500 shadow-md' : 'border-slate-200'}`}>
 
-                <div className="px-4 pt-3 flex items-center justify-between gap-2">
-                  <button onClick={() => toggleCompare(h.id)}
-                    className="flex items-center gap-2">
-                    <span className={`w-5 h-5 rounded-md border-2 flex items-center justify-center transition-all
-                      ${selected ? 'bg-teal-500 border-teal-500' : 'border-slate-300 bg-white'}`}>
+                {/* Compare toggle — visually distinct zone, full-width, separate from card body */}
+                <div className={`flex items-center border-b px-3 py-0
+                  ${selected ? 'bg-teal-50 border-teal-200' : 'bg-slate-50 border-slate-200'}`}>
+                  <button
+                    onClick={() => toggleCompare(h.id)}
+                    className="flex items-center gap-3 flex-1 py-3 min-h-[48px]">
+                    <span className={`w-6 h-6 rounded-md border-2 flex items-center justify-center transition-all shrink-0
+                      ${selected ? 'bg-teal-500 border-teal-500' : 'border-slate-400 bg-white'}`}>
                       {selected && (
-                        <svg className="w-3 h-3 text-white" fill="none" stroke="currentColor" strokeWidth="3" viewBox="0 0 24 24">
+                        <svg className="w-3.5 h-3.5 text-white" fill="none" stroke="currentColor" strokeWidth="3" viewBox="0 0 24 24">
                           <path strokeLinecap="round" strokeLinejoin="round" d="M5 13l4 4L19 7" />
                         </svg>
                       )}
                     </span>
-                    <span className="text-xs text-slate-500 font-medium">
-                      {selected ? 'Selected for compare' : 'Add to compare'}
+                    <span className={`text-sm font-semibold ${selected ? 'text-teal-700' : 'text-slate-500'}`}>
+                      {selected ? 'Selected for compare ✓' : 'Select for compare'}
                     </span>
                   </button>
+                  {/* Divider + full-review link, clearly separate from the checkbox */}
+                  <div className="w-px h-8 bg-slate-300 mx-1 shrink-0" />
                   <button
                     onClick={() => { setHomeId(h.id); setReviewOrigin('hub'); setView('review') }}
-                    className="text-xs text-teal-600 font-semibold">
+                    className="text-xs text-teal-600 font-semibold px-3 py-3 shrink-0">
                     Full review →
                   </button>
                 </div>
 
+                {/* Card body — taps to room grid */}
                 <button onClick={() => { setHomeId(h.id); setView('grid') }}
                   className="w-full text-left px-4 py-3">
-                  <p className="font-semibold text-slate-800 text-sm leading-snug">{h.address}</p>
+                  <p className="font-semibold text-slate-800 text-sm leading-snug">{displayName(h)}</p>
+                  {h.nickname?.trim() && (
+                    <p className="text-xs text-slate-400 truncate">{h.address}</p>
+                  )}
                   <div className="flex flex-wrap gap-x-2 mt-0.5 text-xs text-slate-500">
                     {h.price && <span>${Number(h.price).toLocaleString()}</span>}
                     {h.beds  && <span>{h.beds}bd</span>}
@@ -843,7 +955,7 @@ export default function TourApp() {
                       className="bg-white rounded-2xl border border-slate-200 p-4 opacity-50">
                       <div className="flex items-start justify-between gap-3">
                         <div className="flex-1 min-w-0">
-                          <p className="font-semibold text-slate-700 text-sm leading-snug line-clamp-1">{h.address}</p>
+                          <p className="font-semibold text-slate-700 text-sm leading-snug line-clamp-1">{displayName(h)}</p>
                           <p className="text-xs text-slate-400 mt-0.5">📅 {formatDate(h.dateSeen)}</p>
                           <div className="flex gap-2 mt-1.5">
                             <span className="text-xs text-slate-500">❤️ {loved}</span>
@@ -903,7 +1015,10 @@ export default function TourApp() {
         <button
           onClick={() => { setHomeId(h.id); setView('grid') }}
           className="bg-white rounded-2xl p-4 border border-slate-200 text-left w-full shadow-sm">
-          <p className="font-semibold text-slate-800 text-base leading-tight">{h.address}</p>
+          <p className="font-semibold text-slate-800 text-base leading-tight">{displayName(h)}</p>
+          {h.nickname?.trim() && (
+            <p className="text-xs text-slate-400 mt-0.5 truncate">{h.address}</p>
+          )}
           <div className="flex flex-wrap gap-x-3 gap-y-0 mt-1 text-xs text-slate-500">
             {h.price && <span>${Number(h.price).toLocaleString()}</span>}
             {h.beds  && <span>{h.beds} bed</span>}
@@ -958,7 +1073,7 @@ export default function TourApp() {
                         <button
                           onClick={() => { setHomeId(h.id); setView('grid') }}
                           className="flex-1 min-w-0 text-left">
-                          <p className="font-semibold text-slate-700 text-sm leading-snug line-clamp-1">{h.address}</p>
+                          <p className="font-semibold text-slate-700 text-sm leading-snug line-clamp-1">{displayName(h)}</p>
                           <p className="text-xs text-slate-400 mt-0.5">📅 {formatDate(h.dateSeen)}</p>
                           <div className="flex gap-2 mt-1.5">
                             <span className="text-xs text-slate-500">❤️ {loved}</span>
@@ -1034,20 +1149,43 @@ function Field({ label, children }) {
   )
 }
 
+// +/- stepper with a text input for beds/baths — large tap targets
+function NumberStepper({ value, onChange }) {
+  const num   = parseInt(value, 10)
+  const valid = !isNaN(num)
+  return (
+    <div className="flex items-stretch border border-slate-300 rounded-xl overflow-hidden bg-white">
+      <button type="button"
+        onClick={() => onChange(valid && num > 0 ? String(num - 1) : '0')}
+        className="w-12 flex items-center justify-center text-xl font-bold text-slate-600 active:bg-slate-100 border-r border-slate-200 shrink-0">
+        −
+      </button>
+      <input
+        type="number"
+        inputMode="numeric"
+        value={value}
+        onChange={e => onChange(e.target.value)}
+        placeholder="0"
+        className="flex-1 text-center text-base font-semibold text-slate-800 focus:outline-none min-w-0 py-3 bg-transparent"
+        style={{ WebkitAppearance: 'none', MozAppearance: 'textfield' }}
+      />
+      <button type="button"
+        onClick={() => onChange(String((valid ? num : 0) + 1))}
+        className="w-12 flex items-center justify-center text-xl font-bold text-slate-600 active:bg-slate-100 border-l border-slate-200 shrink-0">
+        +
+      </button>
+    </div>
+  )
+}
+
 // ── Compare view ───────────────────────────────────────────────────────────────
 
 const COMPARE_PALETTE = [
-  { bg: 'bg-teal-500',   border: 'border-teal-300',   light: 'bg-teal-50',   text: 'text-teal-700',   chip: 'bg-teal-500'   },
-  { bg: 'bg-violet-500', border: 'border-violet-300', light: 'bg-violet-50', text: 'text-violet-700', chip: 'bg-violet-500' },
-  { bg: 'bg-amber-500',  border: 'border-amber-300',  light: 'bg-amber-50',  text: 'text-amber-700',  chip: 'bg-amber-500'  },
-  { bg: 'bg-rose-500',   border: 'border-rose-300',   light: 'bg-rose-50',   text: 'text-rose-700',   chip: 'bg-rose-500'   },
+  { bg: 'bg-teal-500',   border: 'border-teal-300',   light: 'bg-teal-50',   text: 'text-teal-700',   expandBtn: 'bg-teal-100 text-teal-700 border-teal-300'   },
+  { bg: 'bg-violet-500', border: 'border-violet-300', light: 'bg-violet-50', text: 'text-violet-700', expandBtn: 'bg-violet-100 text-violet-700 border-violet-300' },
+  { bg: 'bg-amber-500',  border: 'border-amber-300',  light: 'bg-amber-50',  text: 'text-amber-700',  expandBtn: 'bg-amber-100 text-amber-700 border-amber-300'  },
+  { bg: 'bg-rose-500',   border: 'border-rose-300',   light: 'bg-rose-50',   text: 'text-rose-700',   expandBtn: 'bg-rose-100 text-rose-700 border-rose-300'    },
 ]
-
-function shortLabel(address) {
-  const street = address.split(',')[0].trim()
-  const words  = street.split(/\s+/)
-  return words.length >= 2 ? `${words[0]} ${words[1]}` : street.slice(0, 16)
-}
 
 function CompareView({ compareHomes, onBack }) {
   const [attr,       setAttr      ] = useState('overview')
@@ -1057,7 +1195,7 @@ function CompareView({ compareHomes, onBack }) {
   const homes = compareHomes.map((h, i) => ({
     ...h,
     _color: COMPARE_PALETTE[i % COMPARE_PALETTE.length],
-    _label: shortLabel(h.address),
+    _label: shortLabel(h),
   }))
 
   const allRoomNames = [
@@ -1068,12 +1206,12 @@ function CompareView({ compareHomes, onBack }) {
   ]
 
   const ATTRS = [
-    { id: 'overview',  label: 'Overview' },
+    { id: 'overview',  label: 'Overview'  },
     ...allRoomNames.map(r => ({ id: r, label: r })),
-    { id: 'likes',     label: 'Likes'    },
-    { id: 'concerns',  label: 'Concerns' },
-    { id: 'price',     label: 'Price'    },
-    { id: 'date',      label: 'Date seen'},
+    { id: 'likes',     label: 'Likes'     },
+    { id: 'concerns',  label: 'Concerns'  },
+    { id: 'price',     label: 'Price'     },
+    { id: 'date',      label: 'Date seen' },
   ]
 
   return (
@@ -1121,25 +1259,32 @@ function CompareView({ compareHomes, onBack }) {
             })}
           </div>
 
-          <div className="bg-white border-b border-slate-200 py-2.5">
-            <div className="overflow-x-auto px-4">
-              <div className="flex gap-1.5 w-max">
-                {ATTRS.map(a => (
-                  <button key={a.id}
-                    onClick={() => setAttr(a.id)}
-                    className={`px-3 py-1 rounded-full text-xs font-semibold whitespace-nowrap transition-all
-                      ${attr === a.id ? 'bg-navy text-white' : 'bg-slate-100 text-slate-600'}`}>
-                    {a.label}
-                  </button>
-                ))}
+          {/* Section chip selector with scroll-fade affordance */}
+          <div className="bg-white border-b border-slate-200 pt-2.5 pb-1">
+            <div className="relative">
+              <div className="overflow-x-auto px-4 pb-1.5">
+                <div className="flex gap-1.5 w-max">
+                  {ATTRS.map(a => (
+                    <button key={a.id}
+                      onClick={() => setAttr(a.id)}
+                      className={`px-3 py-1 rounded-full text-xs font-semibold whitespace-nowrap transition-all
+                        ${attr === a.id ? 'bg-navy text-white' : 'bg-slate-100 text-slate-600'}`}>
+                      {a.label}
+                    </button>
+                  ))}
+                </div>
               </div>
+              {/* Right fade signals more chips to scroll to */}
+              <div className="absolute right-0 top-0 bottom-1.5 w-10 bg-gradient-to-l from-white to-transparent pointer-events-none" />
             </div>
+            <p className="text-xs text-slate-400 text-center pb-1.5">← swipe to see all sections →</p>
           </div>
         </div>
 
         <div className="flex-1 p-4 flex flex-col gap-3 pb-8">
           <p className="text-xs font-semibold text-slate-400 uppercase tracking-wide">
             {ATTRS.find(a => a.id === attr)?.label ?? attr}
+            <span className="normal-case font-normal ml-2 text-slate-300">· tap ▼ Full notes on any card to expand</span>
           </p>
 
           {homes.map(h => {
@@ -1148,15 +1293,17 @@ function CompareView({ compareHomes, onBack }) {
               <div key={h.id}
                 className={`rounded-2xl border-2 overflow-hidden bg-white ${h._color.border}`}>
                 <div className={`px-4 py-2 flex items-center justify-between ${h._color.light}`}>
-                  <div className="flex items-center gap-2">
-                    <span className={`w-2.5 h-2.5 rounded-full ${h._color.bg}`} />
-                    <span className={`font-bold text-sm ${h._color.text}`}>{h._label}</span>
-                    <span className="text-xs text-slate-500 truncate max-w-[160px]">{h.address}</span>
+                  <div className="flex items-center gap-2 min-w-0">
+                    <span className={`w-2.5 h-2.5 rounded-full shrink-0 ${h._color.bg}`} />
+                    <span className={`font-bold text-sm truncate ${h._color.text}`}>{h._label}</span>
+                    <span className="text-xs text-slate-500 truncate max-w-[120px] hidden sm:inline">{h.address}</span>
                   </div>
+                  {/* Expand button styled as a real button for visibility */}
                   <button
                     onClick={() => setExpandedId(isExpanded ? null : h.id)}
-                    className={`text-xs font-semibold shrink-0 ml-2 ${h._color.text}`}>
-                    {isExpanded ? 'Collapse ▲' : 'Expand ▼'}
+                    className={`text-xs font-semibold shrink-0 ml-2 px-2.5 py-1 rounded-lg border transition-all
+                      ${isExpanded ? h._color.expandBtn : 'bg-white text-slate-500 border-slate-300'}`}>
+                    {isExpanded ? '▲ Less' : '▼ Full notes'}
                   </button>
                 </div>
 
@@ -1256,13 +1403,14 @@ function CompareAttrContent({ home, attr, onLightbox }) {
         </p>
       )}
 
+      {/* Photo thumbnails — contain (no crop) */}
       {roomPhotos.length > 0 && (
         <div className="flex flex-wrap gap-2">
           {roomPhotos.map((photo, idx) => (
             <button key={idx} onClick={() => onLightbox(photo)} className="relative block">
               <img src={photo} alt={`${attr} photo ${idx + 1}`}
-                className="rounded-xl"
-                style={{ width: '72px', height: '72px', objectFit: 'cover', display: 'block' }} />
+                className="rounded-xl bg-slate-100"
+                style={{ width: '72px', height: '72px', objectFit: 'contain', display: 'block' }} />
             </button>
           ))}
         </div>
@@ -1301,7 +1449,7 @@ function CompareExpandedDetail({ home }) {
                   </div>
                   <div className="flex gap-1 shrink-0">
                     {rdata.photos?.length > 0 && <span className="text-xs">📷</span>}
-                    {rdata.voiceNote          && <span className="text-xs">🎤</span>}
+                    {rdata.voiceNote           && <span className="text-xs">🎤</span>}
                   </div>
                 </div>
               )
@@ -1313,10 +1461,10 @@ function CompareExpandedDetail({ home }) {
       {hasOverall && (
         <div className="bg-white rounded-xl p-3 border border-slate-100 flex flex-col gap-2">
           {[
-            { key: 'likes',    label: '❤️ Liked'    },
-            { key: 'dislikes', label: '⚠ Concerns'  },
-            { key: 'feeling',  label: '💭 Feeling'   },
-            { key: 'closing',  label: '📌 Closing'   },
+            { key: 'likes',    label: '❤️ Liked'   },
+            { key: 'dislikes', label: '⚠ Concerns' },
+            { key: 'feeling',  label: '💭 Feeling'  },
+            { key: 'closing',  label: '📌 Closing'  },
           ].filter(f => home.overall[f.key]).map(f => (
             <div key={f.key}>
               <p className="text-xs text-slate-400 font-medium">{f.label}</p>
